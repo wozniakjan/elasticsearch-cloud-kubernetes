@@ -17,6 +17,8 @@ package io.fabric8.elasticsearch.discovery.kubernetes;
 
 import io.fabric8.elasticsearch.cloud.kubernetes.KubernetesAPIService;
 import io.fabric8.kubernetes.api.model.Endpoints;
+import io.fabric8.kubernetes.api.model.Pod;
+
 import org.elasticsearch.Version;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.component.AbstractComponent;
@@ -42,6 +44,8 @@ public class KubernetesUnicastHostsProvider extends AbstractComponent implements
   private final Version version;
   private final String namespace;
   private final String serviceName;
+  private final String podLabel;
+  private final String podPort;
   private final TimeValue refreshInterval;
   private final KubernetesAPIService kubernetesAPIService;
   private TransportService transportService;
@@ -64,6 +68,8 @@ public class KubernetesUnicastHostsProvider extends AbstractComponent implements
     this.refreshInterval = settings.getAsTime(KubernetesAPIService.Fields.REFRESH, TimeValue.timeValueSeconds(0));
     this.namespace = settings.get(KubernetesAPIService.Fields.NAMESPACE);
     this.serviceName = settings.get(KubernetesAPIService.Fields.SERVICE_NAME);
+    this.podLabel = settings.get(KubernetesAPIService.Fields.POD_LABEL);
+    this.podPort = settings.get(KubernetesAPIService.Fields.POD_PORT);
   }
 
   /**
@@ -77,13 +83,87 @@ public class KubernetesUnicastHostsProvider extends AbstractComponent implements
     final List<DiscoveryNode> result = new ArrayList<>();
     AccessController.
       doPrivileged((PrivilegedAction) () -> {
-        result.addAll(readNodes());
+        if(this.podLabel != null) {
+          result.addAll(readNodesByLabel());
+        } else {
+          result.addAll(readNodes());
+        }
         return null;
       });
 
     return result;
   }
 
+  private List<DiscoveryNode> readNodesByLabel() {
+    if (refreshInterval.millis() != 0) {
+      if (cachedDiscoNodes != null &&
+        (refreshInterval.millis() < 0 || (System.currentTimeMillis() - lastRefresh) < refreshInterval.millis())) {
+        if (logger.isTraceEnabled()) logger.trace("using cache to retrieve node list");
+        return cachedDiscoNodes;
+      }
+      lastRefresh = System.currentTimeMillis();
+    }
+    logger.debug("start building nodes list using Kubernetes API");
+
+    cachedDiscoNodes = new ArrayList<>();
+    String tmpIPAddress = null;
+    try {
+      InetAddress inetAddress = networkService.resolvePublishHostAddresses(null);
+      if (inetAddress != null) {
+        tmpIPAddress = NetworkAddress.format(inetAddress);
+      }
+    } catch (IOException e) {
+      // We can't find the publish host address... Hmmm. Too bad :-(
+      // We won't simply filter it
+    }
+    final String ipAddress = tmpIPAddress;
+
+    try {
+      //Endpoints endpoints = kubernetesAPIService.endpoints();
+      List<Pod> pods = kubernetesAPIService.pods();
+      if (pods == null || pods.isEmpty()) {
+        logger.warn("no endpoints found for service [{}], namespace [{}].", this.serviceName, this.namespace);
+        return cachedDiscoNodes;
+      }
+      pods.stream().forEach((pod) -> {
+          String ip = pod.getStatus().getPodIP();
+          try {
+            InetAddress endpointAddress = InetAddress.getByName(ip);
+            String formattedEndpointAddress = NetworkAddress.format(endpointAddress);
+            try {
+              if (formattedEndpointAddress.equals(ipAddress)) {
+                // We found the current node.
+                // We can ignore it in the list of DiscoveryNode
+                logger.trace("current node found. Ignoring {}", ipAddress);
+              } else {
+	            try {
+	              TransportAddress[] addresses = transportService.addressesFromString(formattedEndpointAddress + ":" + this.podPort, 1);
+	              
+	              for (TransportAddress transportAddress : addresses) {
+	                logger.info("adding endpoint {}, transport_address {}", endpointAddress, transportAddress);
+	                cachedDiscoNodes.add(new DiscoveryNode("#cloud-" + endpointAddress + "-" + 0, transportAddress, version.minimumCompatibilityVersion()));
+	              }
+	            } catch (Exception e) {
+	              logger.warn("failed to add endpoint {}", e, endpointAddress);
+	            }
+              }
+            } catch (Exception e) {
+              logger.warn("failed to add endpoint {}", e, endpointAddress);
+            }
+          } catch (UnknownHostException e) {
+            logger.warn("Ignoring invalid endpoint IP address: {}", e, ip);
+          }
+      });
+    } catch (Throwable e) {
+      logger.warn("Exception caught during discovery: {}", e, e.getMessage());
+    }
+
+    logger.debug("{} node(s) added", cachedDiscoNodes.size());
+    logger.debug("using dynamic discovery nodes {}", cachedDiscoNodes);
+
+    return cachedDiscoNodes;
+  }
+  
   private List<DiscoveryNode> readNodes() {
     if (refreshInterval.millis() != 0) {
       if (cachedDiscoNodes != null &&
